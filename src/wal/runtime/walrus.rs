@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
 use super::WalIndex;
-use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check};
+use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker};
 use super::background::start_background_workers;
 use super::reader::Reader;
 use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
@@ -92,6 +92,7 @@ impl Walrus {
 
         let allocator = Arc::new(BlockAllocator::new(paths.clone())?);
         let reader = Arc::new(Reader::new());
+        super::register_reader(&reader);
         let tx_arc = start_background_workers(fsync_schedule);
         let clean_store = Arc::new(CleanMarkerStore::new_in(&paths, "topic_clean")?);
         let topic_clean_tracker = TopicCleanTracker::new(clean_store.clone());
@@ -412,9 +413,23 @@ impl Walrus {
             }
         }
 
-        // enqueue deletion checks
+        // Mark every recovered file as fully-allocated so it becomes
+        // eligible for reclamation if its blocks are all checkpointed.
+        // The allocator's brand-new active file (created by
+        // `BlockAllocator::new` before this scan ran) must be excluded
+        // — marking it fully-allocated would let it be deleted as soon
+        // as the first writer's block is sealed and drained, while the
+        // writer is still using it.
+        //
+        // `set_fully_allocated` calls `flush_check` internally, so this
+        // both fixes the readiness condition and enqueues any zombie
+        // segments left behind by a previous session.
+        let active_path = self.allocator.current_file_path();
         for f in seen_files.into_iter() {
-            flush_check(f);
+            if f == active_path {
+                continue;
+            }
+            FileStateTracker::set_fully_allocated(f);
         }
 
         unsafe {

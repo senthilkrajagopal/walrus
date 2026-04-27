@@ -211,9 +211,7 @@ impl SharedMmapKeeper {
 
     // Fast path: many readers concurrently
     fn get_mmap_arc_read(path: &str) -> Option<Arc<SharedMmap>> {
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
-        let keeper = keeper_lock.read().ok()?;
+        let keeper = Self::keeper_lock().read().ok()?;
         keeper.data.get(path).cloned()
     }
 
@@ -223,8 +221,7 @@ impl SharedMmapKeeper {
             return Ok(existing);
         }
 
-        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
-        let keeper_lock = MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()));
+        let keeper_lock = Self::keeper_lock();
 
         // Double-check with a fresh read lock to avoid unnecessary write lock
         {
@@ -246,6 +243,22 @@ impl SharedMmapKeeper {
         let arc = SharedMmap::new(path)?;
         keeper.data.insert(path.to_string(), arc.clone());
         Ok(arc)
+    }
+
+    /// Drop the keeper's reference to `path` so the FD/mmap it owns can
+    /// be released as soon as every other holder lets go. Called by the
+    /// background reclaimer right before unlinking a fully-drained
+    /// segment file.
+    pub(crate) fn evict(path: &str) {
+        let keeper_lock = Self::keeper_lock();
+        if let Ok(mut keeper) = keeper_lock.write() {
+            keeper.data.remove(path);
+        }
+    }
+
+    fn keeper_lock() -> &'static RwLock<SharedMmapKeeper> {
+        static MMAP_KEEPER: OnceLock<RwLock<SharedMmapKeeper>> = OnceLock::new();
+        MMAP_KEEPER.get_or_init(|| RwLock::new(SharedMmapKeeper::new()))
     }
 }
 

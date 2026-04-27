@@ -158,6 +158,18 @@ impl BlockAllocator {
         self.lock.store(false, Ordering::Release);
     }
 
+    /// Returns the path of the file the allocator is currently writing
+    /// into. Used by startup recovery to avoid prematurely marking the
+    /// active file as fully-allocated — every *other* file on disk at
+    /// startup belongs to a previous session and is by definition done.
+    pub(super) fn current_file_path(&self) -> String {
+        self.lock();
+        // SAFETY: spin lock held — exclusive access to next_block.
+        let path = unsafe { (*self.next_block.get()).file_path.clone() };
+        self.unlock();
+        path
+    }
+
     pub(super) unsafe fn fast_forward(&self, next_id: u64) {
         self.lock();
         let data = unsafe { &mut *self.next_block.get() };

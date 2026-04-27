@@ -7,7 +7,7 @@ use std::io;
 use std::sync::{Arc, RwLock};
 
 use rkyv::{AlignedVec, Deserialize};
-use tracing::info;
+use tracing::trace;
 
 #[cfg(target_os = "linux")]
 use crate::wal::config::USE_FD_BACKEND;
@@ -157,6 +157,13 @@ impl Walrus {
                         // Drop the column lock before touching the index to avoid lock inversion
                         drop(info);
                         if checkpoint {
+                            // Eagerly mark the block checkpointed when this
+                            // read drained it, so the file becomes eligible
+                            // for reclamation without waiting for the next
+                            // call to re-enter the planning loop.
+                            if new_off >= block.used {
+                                BlockStateTracker::set_checkpointed_true(block.id as usize);
+                            }
                             if let Some((idx_val, off_val)) = maybe_persist {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
                                     let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
@@ -383,7 +390,7 @@ impl Walrus {
 
         const TAIL_FLAG: u64 = 1u64 << 63;
 
-        info!(
+        trace!(
             "batch_read_for_topic: col_name={}, max_bytes={}, checkpoint={}, start_offset={:?}",
             col_name, max_bytes, checkpoint, start_offset
         );
@@ -427,7 +434,7 @@ impl Walrus {
                     io::Error::new(io::ErrorKind::Other, "col info read lock poisoned")
                 })?;
 
-                info!(
+                trace!(
                     "batch_read_for_topic: (stateless) initial chain len: {}",
                     guard.chain.len()
                 );
@@ -445,20 +452,20 @@ impl Walrus {
 
             let mut found = false;
 
-            info!(
+            trace!(
                 "batch_read_for_topic: (stateless) searching for block with req_offset={}, initial rem={}",
                 req_offset, rem
             );
 
             for (i, b) in chain.iter().enumerate() {
-                info!(
+                trace!(
                     "batch_read_for_topic: (stateless) iterating block {} (id={}), used={}, rem={}",
                     i, b.id, b.used, rem
                 );
                 if rem < b.used {
                     c_idx = i;
                     found = true;
-                    info!(
+                    trace!(
                         "batch_read_for_topic: (stateless) found block {} (id={}), rem={}",
                         c_idx, b.id, rem
                     );
@@ -478,18 +485,18 @@ impl Walrus {
                 // Use mmap for fast scanning if possible
                 let mut meta_buf = [0u8; PREFIX_META_SIZE];
 
-                info!(
+                trace!(
                     "batch_read_for_topic: (stateless) scanning block {} (id={}) for entry boundary, blk.used={}, rem={}",
                     c_idx, blk.id, blk.used, rem
                 );
 
                 while scan_pos < blk.used {
-                    info!(
+                    trace!(
                         "batch_read_for_topic: (stateless) scan_pos={}, rem={}",
                         scan_pos, rem
                     );
                     if scan_pos + (PREFIX_META_SIZE as u64) > blk.used {
-                        info!(
+                        trace!(
                             "batch_read_for_topic: (stateless) breaking scan_pos+PREFIX_META_SIZE > blk.used"
                         );
                         break; // Should not happen in sealed block
@@ -500,7 +507,7 @@ impl Walrus {
                         .read((blk.offset + scan_pos) as usize, &mut meta_buf);
                     let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
                     if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-                        info!(
+                        trace!(
                             "batch_read_for_topic: (stateless) breaking meta_len invalid: {}",
                             meta_len
                         );
@@ -514,7 +521,7 @@ impl Walrus {
                     let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
                         Ok(m) => m,
                         Err(_) => {
-                            info!(
+                            trace!(
                                 "batch_read_for_topic: (stateless) breaking meta deserialize error"
                             );
                             break;
@@ -525,14 +532,14 @@ impl Walrus {
                     let entry_total = (PREFIX_META_SIZE + data_size) as u64;
                     let entry_end = scan_pos + entry_total;
 
-                    info!(
+                    trace!(
                         "batch_read_for_topic: (stateless) scanned entry: meta_len={}, data_size={}, entry_total={}, entry_end={}",
                         meta_len, data_size, entry_total, entry_end
                     );
 
                     // Special handling for start_offset = 0 to skip small initial entries (likely internal metadata)
                     if rem == 0 && data_size < 128 {
-                        info!(
+                        trace!(
                             "batch_read_for_topic: (stateless) skipping small initial entry (rem=0, data_size={})",
                             data_size
                         );
@@ -547,12 +554,12 @@ impl Walrus {
                         let payload_start = scan_pos + (PREFIX_META_SIZE as u64);
                         if rem > payload_start {
                             trim = (rem - payload_start) as usize;
-                            info!(
+                            trace!(
                                 "batch_read_for_topic: (stateless) found entry containing rem: c_off={}, trim={}",
                                 c_off, trim
                             );
                         } else {
-                            info!(
+                            trace!(
                                 "batch_read_for_topic: (stateless) found entry containing rem (no trim): c_off={}",
                                 c_off
                             );
@@ -567,7 +574,7 @@ impl Walrus {
                 // we default to c_off=scan_pos (end of valid data)
                 if scan_pos >= blk.used {
                     c_off = blk.used;
-                    info!(
+                    trace!(
                         "batch_read_for_topic: (stateless) scan loop finished, c_off={}",
                         c_off
                     );
@@ -576,7 +583,7 @@ impl Walrus {
                 c_idx = chain.len();
                 c_off = 0;
                 // rem is now offset into tail (writer)
-                info!(
+                trace!(
                     "batch_read_for_topic: (stateless) block not found, setting c_idx={}, c_off={}",
                     c_idx, c_off
                 );
@@ -676,6 +683,12 @@ impl Walrus {
         let mut plan: Vec<ReadPlan> = Vec::new();
         let mut planned_bytes: usize = 0;
         let chain_len_at_plan = chain.len();
+        // Remember where this drain started so we can mark every block
+        // in [start_cur_idx, final_block_idx) as checkpointed once the
+        // parse succeeds. Without this, blocks that are fully drained
+        // *in the middle* of a single batch read never get marked, and
+        // the segment files that contain them are never reclaimed.
+        let start_cur_idx = cur_idx;
 
         while cur_idx < chain.len() && planned_bytes < max_bytes {
             let block = chain[cur_idx].clone();
@@ -1075,7 +1088,7 @@ impl Walrus {
                         let mut c_idx_bytes = [0u8; 8];
                         c_idx_bytes.copy_from_slice(&final_data[1..9]);
                         let c_idx = u64::from_be_bytes(c_idx_bytes); // Big-endian
-                        info!(
+                        trace!(
                             "batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}",
                             t_idx, c_idx
                         );
@@ -1104,6 +1117,33 @@ impl Walrus {
 
         // 5) Commit progress (optional)
         if entries_parsed > 0 {
+            // Mark every fully-drained sealed block checkpointed so the
+            // file-state tracker can reclaim segment files. Stateful
+            // checkpointing reads only — the `start_offset` (stateless)
+            // path doesn't own the shared cursor and must not poke the
+            // shared block-state tracker.
+            if checkpoint && start_offset.is_none() {
+                // Blocks strictly between the starting index and the
+                // final landing block were drained in full this call.
+                let upper = if saw_tail {
+                    chain_len_at_plan.min(chain.len())
+                } else {
+                    final_block_idx.min(chain.len())
+                };
+                for i in start_cur_idx..upper {
+                    BlockStateTracker::set_checkpointed_true(chain[i].id as usize);
+                }
+                // The landing block itself, when we read it to its end.
+                if !saw_tail
+                    && final_block_idx < chain.len()
+                    && final_block_offset >= chain[final_block_idx].used
+                {
+                    BlockStateTracker::set_checkpointed_true(
+                        chain[final_block_idx].id as usize,
+                    );
+                }
+            }
+
             enum PersistTarget {
                 Tail { blk_id: u64, off: u64 },
                 Sealed { idx: u64, off: u64 },

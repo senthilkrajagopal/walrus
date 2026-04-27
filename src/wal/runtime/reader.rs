@@ -96,4 +96,42 @@ impl Reader {
         );
         Ok(())
     }
+
+    /// Drop every `Block` from every column's chain whose `file_path`
+    /// matches `path`. Called by the background reclaimer just before
+    /// unlinking a fully-drained segment so the last `Arc<SharedMmap>`
+    /// clones are released and the kernel can reclaim inode space.
+    ///
+    /// Reclamation only fires once a file is fully drained (every block
+    /// checkpointed), so by construction `cur_block_idx` is past every
+    /// block we're removing — we just shift it down by the count of
+    /// removed entries to keep the cursor pointing at the same logical
+    /// position in the (now shorter) chain.
+    pub(super) fn purge_file(&self, path: &str) {
+        let map = match self.data.read() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        for info_arc in map.values() {
+            let mut info = match info_arc.write() {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let removed = info.chain.iter().filter(|b| b.file_path == path).count();
+            if removed == 0 {
+                continue;
+            }
+            info.chain.retain(|b| b.file_path != path);
+            info.cur_block_idx = info.cur_block_idx.saturating_sub(removed);
+            if info.cur_block_idx > info.chain.len() {
+                info.cur_block_idx = info.chain.len();
+            }
+            debug_print!(
+                "[reader] purge_file: path={}, removed_blocks={}, chain_len_now={}",
+                path,
+                removed,
+                info.chain.len()
+            );
+        }
+    }
 }

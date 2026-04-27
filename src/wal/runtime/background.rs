@@ -1,5 +1,5 @@
 use crate::wal::config::{FsyncSchedule, debug_print};
-use crate::wal::storage::{StorageImpl, open_storage_for_path};
+use crate::wal::storage::{SharedMmapKeeper, StorageImpl, open_storage_for_path};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -164,32 +164,57 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                 }
             }
 
-            // Phase 4: Handle deletion requests
+            // Phase 4: Handle deletion requests. Drain the channel into
+            // `delete_pending` and then act on every queued path this
+            // cycle — readers checkpoint blocks promptly, so leaving
+            // fully-drained 1 GiB segments around for ~100 cycles
+            // (the old gating) was the source of the on-disk leak.
             while let Ok(path) = del_rx.try_recv() {
                 debug_print!("[reclaim] deletion requested: {}", path);
                 delete_pending.insert(path);
             }
 
-            // Phase 5: Periodic cleanup
+            if !delete_pending.is_empty() {
+                // Drop our flush-pool handle for any path we're about
+                // to unlink, so we're not holding an FD that keeps the
+                // inode pinned post-unlink.
+                for path in delete_pending.iter() {
+                    pool.remove(path);
+                }
+                for path in delete_pending.drain() {
+                    // Evict the global mmap keeper's reference too —
+                    // the keeper is the lifetime owner that outlives
+                    // any individual reader chain entry, and on Unix
+                    // disk space isn't reclaimed until the last FD on
+                    // an unlinked inode closes.
+                    SharedMmapKeeper::evict(&path);
+                    // Drop reader-chain `Block`s that point at this
+                    // path. Each `Block` holds an `Arc<SharedMmap>`,
+                    // so without this purge the chain pins the mmap
+                    // (and its FD) for the life of the process even
+                    // after the file is unlinked — which on macOS is
+                    // exactly how 1 GiB segments can stay alive on
+                    // disk until the process exits.
+                    super::purge_file_from_readers(&path);
+                    match fs::remove_file(&path) {
+                        Ok(_) => debug_print!("[reclaim] deleted file {}", path),
+                        Err(e) => {
+                            debug_print!("[reclaim] delete failed for {}: {}", path, e)
+                        }
+                    }
+                }
+            }
+
+            // Periodic flush-pool reset: bound long-term growth of the
+            // open-handle map without letting it accumulate forever.
             let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= 1000 {
-                // WARN: we clean up once every 1000 times the fsync runs
                 if tick
                     .compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
                     let mut empty: HashMap<String, StorageImpl> = HashMap::new();
-                    std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
-
-                    // Perform batched deletions now that mmaps/fds are dropped
-                    for path in delete_pending.drain() {
-                        match fs::remove_file(&path) {
-                            Ok(_) => debug_print!("[reclaim] deleted file {}", path),
-                            Err(e) => {
-                                debug_print!("[reclaim] delete failed for {}: {}", path, e)
-                            }
-                        }
-                    }
+                    std::mem::swap(&mut pool, &mut empty);
                 }
             }
         }
