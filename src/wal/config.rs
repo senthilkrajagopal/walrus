@@ -39,7 +39,13 @@ pub(crate) const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
 // Expose so integration tests can match the on-disk layout when poking raw files.
 pub const PREFIX_META_SIZE: usize = 256;
 pub(crate) const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;
-pub(crate) const MAX_BATCH_ENTRIES: usize = 2000;
+// Max entries returned by a single `batch_read_for_topic` (and accepted by a
+// single `batch_append_for_topic`). Raised from 2000 → 200_000 so a consumer
+// can drain a large batch in one read: snowmelt's dp-flush does a loss-free
+// peek(checkpoint=false) → vortex-write → consume(checkpoint=true) per read,
+// and a small cap forced one vortex file per 2000 records, fragmenting storage
+// and slowing queries. 200k entries ≈ a few MB at typical record sizes.
+pub(crate) const MAX_BATCH_ENTRIES: usize = 200_000;
 pub(crate) const MAX_BATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB total payload limit
 
 static LAST_MILLIS: AtomicU64 = AtomicU64::new(0);
