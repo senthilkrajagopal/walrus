@@ -372,12 +372,41 @@ impl Walrus {
         }
     }
 
+    /// Byte-bounded batch read (cursor-advancing when `checkpoint`). Caps the
+    /// returned batch at the global `MAX_BATCH_ENTRIES`; see
+    /// [`Self::batch_read_for_topic_capped`] for an explicit per-call entry
+    /// cap (used by loss-free peek/consume drains).
     pub fn batch_read_for_topic(
         &self,
         col_name: &str,
         max_bytes: usize,
         checkpoint: bool,
         start_offset: Option<u64>,
+    ) -> io::Result<Vec<Entry>> {
+        self.batch_read_for_topic_capped(
+            col_name,
+            max_bytes,
+            checkpoint,
+            start_offset,
+            MAX_BATCH_ENTRIES,
+        )
+    }
+
+    /// As [`Self::batch_read_for_topic`], but stops after `max_entries`
+    /// decoded entries (clamped to `MAX_BATCH_ENTRIES`). A byte budget alone
+    /// cannot target an exact entry count — planning bounds on
+    /// header+payload bytes while decode bounds on payload bytes — so the
+    /// loss-free consume path pairs a header-inclusive `max_bytes` (enough to
+    /// buffer every peeked entry) with `max_entries = peeked_count` to advance
+    /// the cursor by EXACTLY the peeked window: no over-consume of entries
+    /// that arrived after the peek, no under-consume of the tail.
+    pub fn batch_read_for_topic_capped(
+        &self,
+        col_name: &str,
+        max_bytes: usize,
+        checkpoint: bool,
+        start_offset: Option<u64>,
+        max_entries: usize,
     ) -> io::Result<Vec<Entry>> {
         // Helper struct for read planning
         struct ReadPlan {
@@ -756,8 +785,8 @@ impl Walrus {
                                             };
                                             let meta2_res: Result<Metadata, _> =
                                                 archived2.deserialize(&mut rkyv::Infallible);
-                                            let meta2 = meta2_res
-                                                .expect("infallible metadata deserialize");
+                                            let meta2 =
+                                                meta2_res.expect("infallible metadata deserialize");
                                             let size2 = meta2.read_size;
                                             let required2 = (PREFIX_META_SIZE + size2) as u64;
                                             final_required = required1 + required2;
@@ -1004,15 +1033,22 @@ impl Walrus {
         let mut entries_parsed = 0u32;
         let mut saw_tail = false;
 
+        // Per-call entry ceiling. Planning may buffer more than the caller
+        // asked for (it bounds on bytes and reads block-granular chunks), so
+        // the decode loop is the precise stopper: it pushes at most
+        // `effective_max_entries` entries and the cursor advances only as far
+        // as the last decoded entry. `MAX_BATCH_ENTRIES` is the global floor.
+        let effective_max_entries = max_entries.min(MAX_BATCH_ENTRIES);
+
         for (plan_idx, read_plan) in plan.iter().enumerate() {
-            if entries.len() >= MAX_BATCH_ENTRIES {
+            if entries.len() >= effective_max_entries {
                 break;
             }
             let buffer = &buffers[plan_idx];
             let mut buf_offset = 0usize;
 
             while buf_offset < buffer.len() {
-                if entries.len() >= MAX_BATCH_ENTRIES {
+                if entries.len() >= effective_max_entries {
                     break;
                 }
                 // Try to read metadata header
@@ -1138,9 +1174,7 @@ impl Walrus {
                     && final_block_idx < chain.len()
                     && final_block_offset >= chain[final_block_idx].used
                 {
-                    BlockStateTracker::set_checkpointed_true(
-                        chain[final_block_idx].id as usize,
-                    );
+                    BlockStateTracker::set_checkpointed_true(chain[final_block_idx].id as usize);
                 }
             }
 

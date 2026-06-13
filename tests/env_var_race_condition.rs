@@ -16,8 +16,7 @@ use walrus_rust::Walrus;
 use walrus_rust::WalrusBuilder;
 
 fn make_temp_dir(name: &str) -> PathBuf {
-    let dir = env::temp_dir()
-        .join(format!("walrus-race-repro-{}-{}", name, std::process::id()));
+    let dir = env::temp_dir().join(format!("walrus-race-repro-{}-{}", name, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -37,7 +36,9 @@ fn test_env_var_race_condition() {
     let b1 = barrier.clone();
     let handle1 = thread::spawn(move || {
         // 1. Set global env var to OUR directory
-        unsafe { env::set_var("WALRUS_DATA_DIR", &path1); }
+        unsafe {
+            env::set_var("WALRUS_DATA_DIR", &path1);
+        }
 
         // 2. Wait for the other thread to also set its env var
         b1.wait();
@@ -57,7 +58,9 @@ fn test_env_var_race_condition() {
     let b2 = barrier.clone();
     let handle2 = thread::spawn(move || {
         // Same sequence, but with the other directory
-        unsafe { env::set_var("WALRUS_DATA_DIR", &path2); }
+        unsafe {
+            env::set_var("WALRUS_DATA_DIR", &path2);
+        }
         b2.wait();
 
         let _wal = Walrus::new_for_key("race_test").unwrap();
@@ -138,6 +141,7 @@ fn test_builder_eliminates_race_condition() {
         "Builder should eliminate the race condition.\n\
          Thread 1 found its dir: {}\n\
          Thread 2 found its dir: {}",
-        t1_ok, t2_ok,
+        t1_ok,
+        t2_ok,
     );
 }

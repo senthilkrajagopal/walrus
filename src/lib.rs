@@ -270,8 +270,8 @@
 #![recursion_limit = "256"]
 pub mod wal;
 pub use wal::{
-    Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, WalrusBuilder,
-    disable_fd_backend, enable_fd_backend,
+    Entry, FsyncSchedule, ReadConsistency, WalIndex, Walrus, WalrusBuilder, disable_fd_backend,
+    enable_fd_backend,
 };
 
 pub fn topic_entry_count(wal: &Walrus, topic: &str) -> u64 {

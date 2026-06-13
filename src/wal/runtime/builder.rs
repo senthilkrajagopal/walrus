@@ -80,9 +80,7 @@ impl WalrusBuilder {
 
     /// Build the [`Walrus`] instance.
     pub fn build(self) -> std::io::Result<Walrus> {
-        let consistency = self
-            .consistency
-            .unwrap_or(ReadConsistency::StrictlyAtOnce);
+        let consistency = self.consistency.unwrap_or(ReadConsistency::StrictlyAtOnce);
         let fsync_schedule = self
             .fsync_schedule
             .unwrap_or(FsyncSchedule::Milliseconds(200));
