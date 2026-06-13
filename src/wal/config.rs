@@ -34,7 +34,20 @@ pub enum FsyncSchedule {
 }
 
 pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 10 * 1024 * 1024; // 10mb
-pub(crate) const BLOCKS_PER_FILE: u64 = 100;
+// Segment files roll over at DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE. Each new
+// file is `set_len`'d to MAX_FILE_SIZE up front (sparse on ext4/xfs, so the
+// apparent size is the full file but real disk = only what's written). A file
+// is reclaimed only once ALL its blocks are checkpointed, so the file size is
+// the WAL's reclamation granularity AND its apparent-size floor per topic.
+// 10 blocks → 100 MiB files: tuned down from 100 (1 GiB) for snowmelt's
+// moderate per-partition ingest — keeps the apparent footprint small (a 4-pod
+// box showed 4 GiB apparent / ~0.5 GiB real with 1 GiB files) and lets the WAL
+// reclaim space at a finer grain. 10 MiB blocks are unchanged (they bound
+// batch-read planning). NOTE: changing MAX_FILE_SIZE is NOT compatible with an
+// existing WAL on disk — recovery scans each file up to MAX_FILE_SIZE, so old
+// 1 GiB files would be mis-read. Wipe the WAL (clean redeploy / PVC reset)
+// when changing this.
+pub(crate) const BLOCKS_PER_FILE: u64 = 10;
 pub(crate) const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
 // Expose so integration tests can match the on-disk layout when poking raw files.
 pub const PREFIX_META_SIZE: usize = 256;
